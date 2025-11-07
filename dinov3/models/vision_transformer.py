@@ -188,15 +188,18 @@ class DinoVisionTransformer(nn.Module):
         named_apply(init_weights_vit, self)
 
     def prepare_tokens_with_masks(self, x: Tensor, masks=None) -> Tuple[Tensor, Tuple[int]]:
-        x = self.patch_embed(x)
+        x = self.patch_embed(x) # input: <B, C, H, W> - > output: <B, H/patch_size, W/patch_size, embed_dim>
         B, H, W, _ = x.shape
-        x = x.flatten(1, 2)
+        x = x.flatten(1, 2) # <B, num_patches, embed_dim>
 
         if masks is not None:
+            # Replace each masked patch token with the learnable mask token
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
             cls_token = self.cls_token
         else:
-            cls_token = self.cls_token + 0 * self.mask_token
+            cls_token = self.cls_token + 0 * self.mask_token # same as self.cls_token, but this is a safety/infra hack preventing DDP/optimizer/autocast issues
+        
+        # Create storage tokens if any
         if self.n_storage_tokens > 0:
             storage_tokens = self.storage_tokens
         else:
@@ -208,6 +211,7 @@ class DinoVisionTransformer(nn.Module):
                 device=cls_token.device,
             )
 
+        # Concatenate class token, storage tokens and patch tokens
         x = torch.cat(
             [
                 cls_token.expand(B, -1, -1),
@@ -222,6 +226,7 @@ class DinoVisionTransformer(nn.Module):
     def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
         x = []
         rope = []
+        # Patchify, masks and combine with storage tokens and cls token
         for t_x, t_masks in zip(x_list, masks_list):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             x.append(t2_x)
@@ -231,6 +236,7 @@ class DinoVisionTransformer(nn.Module):
                 rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
             else:
                 rope_sincos = [None for r in rope]
+            breakpoint()
             x = blk(x, rope_sincos)
         all_x = x
         output = []
@@ -414,3 +420,4 @@ def vit_7b(patch_size=16, **kwargs):
         **kwargs,
     )
     return model
+

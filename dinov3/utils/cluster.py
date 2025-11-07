@@ -95,9 +95,9 @@ def get_slurm_executor_parameters(
         "slurm_partition": get_slurm_partition(cluster_type),
     }
     # apply cluster-specific adjustments
-    cluster_type = get_cluster_type(cluster_type)
-    if cluster_type == ClusterType.CW:
-        params["cpus_per_task"] = 16
-    # set additional parameters / apply overrides
-    params.update(kwargs)
+    # cluster_type = get_cluster_type(cluster_type)
+    # if cluster_type == ClusterType.CW:
+    #     params["cpus_per_task"] = 16
+    # # set additional parameters / apply overrides
+    # params.update(kwargs)
     return params

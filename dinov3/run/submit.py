@@ -44,20 +44,20 @@ def get_submitit_parser():
         type=int,
         help="Duration of the job, default: %(default)s",
     )
-    parser.add_argument(
-        "--slurm-partition",
-        default=slurm_partition,
-        type=str,
-        help="Partition where to submit, default: %(default)s",
-    )
-    parser.add_argument(
-        "--slurm-qos",
-        default=slurm_qos,
-        metavar="SLURM_QOS",
-        type=str,
-        dest="slurm_qos",
-        help="slurm QoS to use for jobs in cluster environment, default: %(default)s",
-    )
+    # parser.add_argument(
+    #     "--slurm-partition",
+    #     default=slurm_partition,
+    #     type=str,
+    #     help="Partition where to submit, default: %(default)s",
+    # )
+    # parser.add_argument(
+    #     "--slurm-qos",
+    #     default=slurm_qos,
+    #     metavar="SLURM_QOS",
+    #     type=str,
+    #     dest="slurm_qos",
+    #     help="slurm QoS to use for jobs in cluster environment, default: %(default)s",
+    # )
     parser.add_argument(
         "--slurm-array-parallelism",
         default=256,
@@ -175,8 +175,6 @@ def submit_jobs(class_to_submit, output_dir, submitit_args, name="fairvit"):
         num_gpus_per_node=submitit_args.ngpus,
         timeout_min=submitit_args.timeout,  # max is 60 * 72
         slurm_signal_delay_s=120,
-        slurm_partition=submitit_args.slurm_partition,
-        slurm_qos=submitit_args.slurm_qos,
         # slurm_account=submitit_args.slurm_account,
         slurm_additional_parameters=dict(nice=submitit_args.slurm_nice),
         **kwargs,
@@ -199,6 +197,8 @@ def main():
 
     if args.output_dir is None:
         args.output_dir = get_shared_folder() / "%j"
+    
+    breakpoint()
 
     class_to_submit = CheckpointableSubmitter(args.module_path, args.callable_name, script_args, args.output_dir)
     submit_jobs(class_to_submit, args.output_dir, args, name=name)
@@ -206,3 +206,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# How to run:
+# PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/train/train.py --nodes 1 -ngpus 4 --timeout 1440 --config-file dinov3/configs/train/vitl_im1k_lin834.yaml --output-dir output train.dataset_path=ImageNet1k:root=/usr/bmicnas02/data-biwi-01/bmicdatasets-originals/Originals/ILSVRC2012_imagenet/imagenet,extra=/usr/bmicnas02/data-biwi-01/bmicdatasets-originals/Originals/ILSVRC2012_imagenet/imagenet

@@ -124,6 +124,7 @@ def _make_dinov3_vit(
     )
     vit_kwargs.update(**kwargs)
     model = DinoVisionTransformer(**vit_kwargs)
+
     if pretrained:
         if type(weights) is Weights and weights not in {Weights.LVD1689M, Weights.SAT493M}:
             raise ValueError(f"Unsupported weights for the backbone: {weights}")
@@ -341,6 +342,7 @@ def dinov3_vitl16(
         if hash == "eadcf0ff":
             untie_global_and_local_cls_norm = True
     kwargs["version"] = None
+
     return _make_dinov3_vit(
         img_size=224,
         patch_size=16,
@@ -349,24 +351,24 @@ def dinov3_vitl16(
         pos_embed_rope_normalize_coords="separate",
         pos_embed_rope_rescale_coords=2,
         pos_embed_rope_dtype="fp32",
-        embed_dim=1024,
-        depth=24,
-        num_heads=16,
-        ffn_ratio=4,
-        qkv_bias=True,
-        drop_path_rate=0.0,
-        layerscale_init=1.0e-05,
-        norm_layer="layernormbf16",
-        ffn_layer="mlp",
-        ffn_bias=True,
-        proj_bias=True,
-        n_storage_tokens=4,
-        mask_k_bias=True,
-        untie_global_and_local_cls_norm=untie_global_and_local_cls_norm,
-        pretrained=pretrained,
-        weights=weights,
-        compact_arch_name="vitl",
-        check_hash=check_hash,
+        embed_dim=1024, # token embedding width (model dimension).
+        depth=24, # number of transformer blocks (layers).
+        num_heads=16, # number of attention heads in each block.
+        ffn_ratio=4, # MLP hidden size multiplier in each block (hidden = 4×embed_dim).
+        qkv_bias=True, # add bias to QKV projections
+        drop_path_rate=0.0, # stochastic depth rate
+        layerscale_init=1.0e-05, # LayerScale init value
+        norm_layer="layernormbf16", # which normalization impl to use (here, a bfloat16-friendly LayerNorm kernel).
+        ffn_layer="mlp", # which MLP/FFN layer to use
+        ffn_bias=True, # add bias to FFN layers
+        proj_bias=True, # add bias to projection layers 
+        n_storage_tokens=4, # number of storage tokens
+        mask_k_bias=True, # add bias to mask tokens
+        untie_global_and_local_cls_norm=untie_global_and_local_cls_norm, # whether to untie the global and local class token norm layers
+        pretrained=pretrained, # whether to load pretrained weights
+        weights=weights, # which checkpoint to load; enum (LVD1689M, SAT493M) or a path/URL.
+        compact_arch_name="vitl", # short architecture tag used to construct the weight filename/URL.
+        check_hash=check_hash, # verify file hash when downloading weights.
         **kwargs,
     )
 
@@ -612,3 +614,6 @@ def dinov3_convnext_large(
     if not pretrained:
         model.init_weights()
     return model
+
+
+
