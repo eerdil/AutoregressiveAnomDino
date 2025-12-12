@@ -100,6 +100,7 @@ def make_dataset(
     logger.info(f'using dataset: "{dataset_str}"')
 
     class_, kwargs = _parse_dataset_str(dataset_str)
+
     dataset = class_(transform=transform, target_transform=target_transform, transforms=transforms, **kwargs)
 
     logger.info(f"# of dataset samples: {len(dataset):,d}")

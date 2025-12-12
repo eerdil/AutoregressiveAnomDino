@@ -53,6 +53,7 @@ class SSLMetaArch(nn.Module):
         torch.cuda.empty_cache()
         gc.collect()
         gram_backbone, _ = build_model_from_cfg(cfg, only_teacher=True)
+
         logger.info(f"Number of parameters: {count_parameters(student_backbone)}")
         student_model_dict["backbone"] = student_backbone
         teacher_model_dict["backbone"] = teacher_backbone

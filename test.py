@@ -1,140 +1,212 @@
-
-import argparse
 import os
 import torch
-from torchvision import transforms
-from PIL import Image
-from sklearn.decomposition import PCA
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+import argparse
 
-BMIC_DATA_PATH = "/usr/bmicnas02/data-biwi-01/fm_originalzoo/dinov3"
-PROJECT_PATH = "/usr/bmicnas02/data-biwi-01/erdile_data/projects/loobesity/DinoV3/"
+from data.brats import get_anomaly_loader
+from models.autoregressive2d import AR2DModel
+from train import load_dinov3_models, extract_dino_tokens_2d
 
-checkpoint_paths = {
-    'dinov3_vits16':         os.path.join(BMIC_DATA_PATH, "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"),
-    'dinov3_vits16plus':     os.path.join(BMIC_DATA_PATH, "dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth"),
-    'dinov3_vitb16':         os.path.join(BMIC_DATA_PATH, "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"),
-    'dinov3_vitl16':         os.path.join(BMIC_DATA_PATH, "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"),
-    'dinov3_vith16plus':     os.path.join(BMIC_DATA_PATH, "dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth"),
-    'dinov3_vit7b16':        os.path.join(BMIC_DATA_PATH, "dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"),
-    'dinov3_convnext_tiny':  os.path.join(BMIC_DATA_PATH, "dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth"),
-    'dinov3_convnext_small': os.path.join(BMIC_DATA_PATH, "dinov3_convnext_small_pretrain_lvd1689m-296db49d.pth"),
-    'dinov3_convnext_base':  os.path.join(BMIC_DATA_PATH, "dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth"),
-    'dinov3_convnext_large': os.path.join(BMIC_DATA_PATH, "dinov3_convnext_large_pretrain_lvd1689m-61fa432d.pth"),
-    'dinov3_vitl16_sat':     os.path.join(BMIC_DATA_PATH, "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"),
-    'dinov3_vit7b16_sat':    os.path.join(BMIC_DATA_PATH, "dinov3_vit7b16_pretrain_sat493m-a6675841.pth"),
-}
+from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision
+from torchmetrics import Metric
 
-def load_dinov3_models(model_type):
-    # DINOv3 ViT models pretrained on web images
-    model = torch.hub.load(repo_or_dir = os.path.join(PROJECT_PATH, "dinov3"), 
-                           model = model_type, 
-                           source='local', 
-                           weights=checkpoint_paths[model_type])
-    return model
+from config.paths import PROJECT_PATH, DATASET_PATH, checkpoint_paths 
+from models.dinov3_utils import load_dinov3_models
+from ar.anomaly_maps import compute_anomaly_maps_2d
+from ar.visualization import select_visualization_subset_from_loader, visualize_anomaly_grid
 
-def make_transform(resize_size: int | list[int] = 768):
-    to_tensor = transforms.ToTensor()
-    resize = transforms.Resize((resize_size, resize_size), antialias=True)
-    normalize = transforms.Normalize(
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
-    )
-    return transforms.Compose([to_tensor, resize, normalize])
+# ---------------------------------------------------------------
+# Evaluation logic (pixel-level, normal vs anomalous stats)
+# ---------------------------------------------------------------
+def evaluate_ar2d_model_pixelwise(
+    dino_model,
+    ar_model,
+    dataloader_test,
+    device,
+    img_size=448,
+    output_dir=None,
+    max_batches=None,
+):
+    dino_model.eval()
+    ar_model.eval()
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
 
-def create_pca_image(features, n_components=3, H=None, W=None):
-    N, S, D = features.shape
-    if S < n_components:
-        raise ValueError(f"Number of tokens {S} is less than the number of PCA components {n_components}.")
+    # Streaming metrics (no giant concatenation)
+    auroc_metric = BinaryAUROC().to(device)
+    aupr_metric = BinaryAveragePrecision().to(device)
+
+    with torch.no_grad():
+        for i, (imgs, labels, targets, meta) in enumerate(tqdm(dataloader_test, desc="Evaluating")):
+            # imgs: [B,3,H,W], labels: [B,1,H,W], targets: [B] (0=normal,1=anomalous)
+            imgs = imgs.to(device)
+            labels = labels.to(device)          # pixel GT mask (0/1)
+            targets = targets.to(device)        # image-level 0/1 (not needed for pixel metrics)
+
+            # 1) anomaly maps at token level
+            anomaly_maps = compute_anomaly_maps_2d(dino_model, ar_model, imgs, device)  # [B, H_tok, W_tok]
+
+            # 2) upsample to image resolution and add channel dim: [B,1,H,W]
+            anomaly_maps_up = F.interpolate(
+                anomaly_maps.unsqueeze(1),      # [B,1,H_tok,W_tok]
+                # size=(img_size, img_size),
+                size=(240, 240),
+                mode="bilinear",
+                align_corners=False,
+            )                                   # [B,1,H,W]
+
+            # ensure label map matches upsampled prediction size
+            if labels.shape[-2:] != anomaly_maps_up.shape[-2:]:
+                labels = F.interpolate(labels, size=anomaly_maps_up.shape[-2:], mode="nearest")
+
+            # 3) flatten per-batch for TorchMetrics
+            preds_batch = anomaly_maps_up.view(-1)        # [B*H*W]
+            labels_batch = labels.view(-1).int()         # [B*H*W]
+
+            # 4) update streaming metrics
+            auroc_metric.update(preds_batch, labels_batch)
+            aupr_metric.update(preds_batch, labels_batch)
+
+            if max_batches is not None and (i + 1) >= max_batches:
+                break
+
+    # -----------------------------------------------------------
+    # Compute final metrics
+    # -----------------------------------------------------------
+    auroc = auroc_metric.compute().item()
+    aupr = aupr_metric.compute().item()
+
+    print(f"Pixel-wise Test AUROC: {auroc:.4f}, AUPR: {aupr:.4f}")
+
+    # Save metrics
+    output_metrics_path = os.path.join(output_dir, "metrics/")
+    os.makedirs(output_metrics_path, exist_ok=True)
+    with open(os.path.join(output_metrics_path, "test_metrics_pixelwise.txt"), "w") as f:
+        f.write(f"AUROC_pixel: {auroc:.4f}\n")
+        f.write(f"AUPR_pixel:  {aupr:.4f}\n")
+
+    return {"AUROC_pixel": auroc, "AUPR_pixel": aupr}
+
+
+# ---------------------------------------------------------------
+# Main script
+# ---------------------------------------------------------------
+if __name__ == "__main__":
     
-    features = features.cpu().numpy()
-    pca = PCA(n_components=n_components)
-    pca_result = pca.fit_transform(features.reshape(N*S, D))
-    if H is None or W is None:
-        H = W = int(S**0.5)
-    pca_result = pca_result.reshape(N, H, W, n_components)
-    return pca_result
+    parser = argparse.ArgumentParser(description="Evaluate AR2D anomaly model on test set (pixel-wise, SOTA-style).")
+    # parser.add_argument("--model", type=str, default="dinov3_vits16",
+    #                     choices=[
+    #                         "dinov3_vits16", "dinov3_vits16plus", "dinov3_vitb16",
+    #                         "dinov3_vitl16", "dinov3_vith16plus"
+    #                     ])
+    # parser.add_argument("--img_size", type=int, default=448)
+    # parser.add_argument("--batch_size", type=int, default=32)
+    # parser.add_argument("--num_workers", type=int, default=4)
+    # parser.add_argument("--non_causal", action="store_true", help="Use non-causal AR model.")
+    # parser.add_argument("--kernel_size", type=int, default=3, help="Kernel size for AR model convolution.")
+    # parser.add_argument("--checkpoint", type=str, required=True, help="Path to AR2D checkpoint (.pth).")
+    # parser.add_argument("--output_dir", type=str, default="./eval_outputs_ar2d", help="Directory to save results.")
 
-def main():
-    parser = argparse.ArgumentParser(description="Visualize DINOv3 features.")
-    parser.add_argument("--model", type=str, default="dinov3_vitl16", choices=checkpoint_paths.keys(), help="Type of DINOv3 model to use.")
-    parser.add_argument("--img_size", type=int, default=1024, help="Size to resize images to.")
+
+    # ARGUMENT PARSING
+    parser.add_argument("--model", type=str, default="dinov3_vits16", choices=checkpoint_paths.keys(), help="Type of DINOv3 model to use.")
+    parser.add_argument("--img_size", type=int, default=448, help="Size to resize images to.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of workers for data loading.")
+    parser.add_argument("--non_causal", action="store_true", help="Use non-causal convs (see past and future pixels).")
+    parser.add_argument("--center_masked_first", action="store_true", help="Use center-masked convs (see all neighbors except center pixel).")
+    parser.add_argument("--kernel_size", type=int, default=3, help="Kernel size for AR model convolution.")
+    parser.add_argument("--experiment_name", type=str, required=True, help="Name of the experiment (must match a folder in results/ directory)")
+
     args = parser.parse_args()
 
     model_type = args.model
     img_size = args.img_size
+    batch_size = args.batch_size
+    num_workers = args.num_workers
+    causal = not args.non_causal
+    kernel_size = args.kernel_size
+    center_masked_first = args.center_masked_first
+    experiment_name = args.experiment_name
 
-    transform = make_transform(img_size)
-    img = Image.open(os.path.join(BMIC_DATA_PATH, "image.png")).convert("RGB")
-    img = transform(img).unsqueeze(0)
+    output_path = os.path.join(PROJECT_PATH, f"results/{experiment_name}")
+    checkpoint_path = os.path.join(output_path, "ckpt/model.pth")
 
-    model = load_dinov3_models(model_type)
+    # ----------------------------
+    # Load DINO and AR2D model
+    # ----------------------------
+    print(f"Loading DINOv3 model: {args.model}")
+    dino = load_dinov3_models(args.model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dino = dino.to(device).eval()
+    for p in dino.parameters():
+        p.requires_grad = False
 
-    model = model.to(device).eval()
-    img = img.to(device)
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
-        # warmup (GPU clocks & cudnn autotune)
-        for _ in range(5):
-            _ = model(img)
+    print(f"Loading AR2D checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    img_size = checkpoint.get("img_size", args.img_size)
 
-        torch.cuda.synchronize()
+    # Determine feature dim automatically
+    dummy_loader = get_anomaly_loader(
+        os.path.join(DATASET_PATH, "valid"), batch_size=1, img_size=img_size, num_workers=0
+    )
+    dummy_imgs, _, _, _ = next(iter(dummy_loader))
+    dummy_feats = extract_dino_tokens_2d(dino, dummy_imgs.to(device), device)
+    C = dummy_feats.shape[1]
 
-        start = torch.cuda.Event(enable_timing=True)
-        end   = torch.cuda.Event(enable_timing=True)
-        iters = 30
-        start.record()
-        for _ in range(iters):
-            token_features = model.get_intermediate_layers(img)[0]
-        end.record()
+    ar_model = AR2DModel(
+        in_channels=C,
+        hidden_channels=256,
+        n_layers=5,
+        kernel_size=kernel_size,
+        causal=causal,
+        center_masked_first=center_masked_first,
+    ).to(device)
+    ar_model.load_state_dict(checkpoint["model_state_dict"])
 
-        torch.cuda.synchronize()
-        ms = start.elapsed_time(end) / iters   # milliseconds per iteration
-        print(f"Avg GPU time {model_type}: {ms:.3f} ms")
+    # ----------------------------
+    # Load test dataset (mixed good + bad)
+    # ----------------------------
+    dataloader_test = get_anomaly_loader(
+        os.path.join(DATASET_PATH, "test"),
+        batch_size=args.batch_size,
+        img_size=img_size,
+        num_workers=args.num_workers,
+    )
 
-        cls_features = model(img)
+    # ----------------------------
+    # Evaluate (pixel-wise)
+    # ----------------------------
+    metrics = evaluate_ar2d_model_pixelwise(
+        dino_model=dino,
+        ar_model=ar_model,
+        dataloader_test=dataloader_test,
+        device=device,
+        img_size=img_size,
+        output_dir=os.path.join(output_path, "test/"),
+    )
 
-    # breakpoint()
-    pca_result = create_pca_image(token_features)
-    pca_result = pca_result.squeeze(0)
-    pca_result = (pca_result - pca_result.min()) / (pca_result.max() - pca_result.min())
-    plt.figure()
-    plt.imshow(pca_result)
-    plt.axis('off')
-    plt.title(f"{model_type}, {img_size}x{img_size}")
-    plt.tight_layout()
-    plt.savefig(os.path.join(PROJECT_PATH, f"pca_result_{model_type}_{img_size}.png"), bbox_inches='tight', pad_inches=0)
-    plt.close()
+    # ----------------------------
+    # Save visual results
+    # ----------------------------
+    imgs_vis, labels_vis = select_visualization_subset_from_loader(
+        dataloader_test,
+        n_anom=10,
+        n_norm=10,
+    )
 
-    # # FORCING FLASH ATTENTION - RESULTS THE SAME PERFORMANCE AS ABOVE. SO ABOVE ALSO USES FLASH ATTENTION
-    # with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
-    #     # ensure parameters run in fp16 too (safer to call once outside the context)
-
-    #     # prefer new API if your torch has it:
-    #     from torch.nn.attention import sdpa_kernel, SDPBackend
-    #     ctx = sdpa_kernel(SDPBackend.FLASH_ATTENTION)  # flash only
-    #     # try:
-    #     #     ctx = sdpa_kernel(enable_flash=True, enable_mem_efficient=False, enable_math=False)
-    #     # except Exception:
-    #     #     ctx = torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=False, enable_math=False)
-
-    #     with ctx:
-    #         # warmup in fp16
-    #         for _ in range(5):
-    #             _ = model(img)
-
-    #         torch.cuda.synchronize()
-    #         start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
-    #         iters = 30
-    #         start.record()
-    #         for _ in range(iters):
-    #             token_features = model.get_intermediate_layers(img)[0]
-    #         end.record()
-    #         torch.cuda.synchronize()
-    #         print(f"Avg GPU time (flash, fp16): {start.elapsed_time(end)/iters:.3f} ms")
-
-    # breakpoint()
-
-if __name__ == "__main__":
-    main()
+    visualize_anomaly_grid(
+            dino_model=dino,
+            ar_model=ar_model,
+            imgs_vis=imgs_vis,          # CPU
+            labels_vis=labels_vis,      # CPU
+            device=device,
+            img_size=img_size,
+            output_dir=os.path.join(output_path, "test/visualizations"),
+            epoch=None,                # will encode index in filename
+    )
+        
+    print(f"Final pixel-wise metrics saved to {output_path}")

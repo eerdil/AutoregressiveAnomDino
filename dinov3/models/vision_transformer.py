@@ -236,7 +236,7 @@ class DinoVisionTransformer(nn.Module):
                 rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
             else:
                 rope_sincos = [None for r in rope]
-            breakpoint()
+
             x = blk(x, rope_sincos)
         all_x = x
         output = []

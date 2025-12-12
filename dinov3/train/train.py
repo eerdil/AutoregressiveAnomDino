@@ -306,6 +306,8 @@ def build_data_loader_from_cfg(
     batch_size = dataloader_batch_size_per_gpu
     num_workers = cfg.train.num_workers
     dataset_path = cfg.train.dataset_path
+
+    # CREATE DATASET
     dataset = make_dataset(
         dataset_str=dataset_path,
         transform=model.build_data_augmentation_dino(cfg),
@@ -317,6 +319,7 @@ def build_data_loader_from_cfg(
     else:
         sampler_type = SamplerType.SHARDED_INFINITE if cfg.train.cache_dataset else SamplerType.INFINITE
 
+    # CREATE DATA LOADER
     data_loader = make_data_loader(
         dataset=dataset,
         batch_size=batch_size,
@@ -337,6 +340,7 @@ def build_multi_resolution_data_loader_from_cfg(
     start_iter,
     seed=65537,
 ):
+
     global_crops_sizes = (
         [cfg.crops.global_crops_size] if isinstance(cfg.crops.global_crops_size, int) else cfg.crops.global_crops_size
     )
@@ -376,6 +380,7 @@ def build_multi_resolution_data_loader_from_cfg(
             seed=seed,
             name="MultiResDL",
         )
+
     return data_loader
 
 
@@ -593,13 +598,28 @@ def main(argv=None):
         logger.info("setup_multidistillation done")
         assert cfg.MODEL.META_ARCHITECTURE == "MultiDistillationMetaArch"
     else:
+        # Initializes the training environment:
+        # - creates the output directory if needed
+        # - sets up logging (file + stdout, rank-0 only)
+        # - initializes distributed training if enabled
+        # - fixes random seeds per rank for reproducibility
+        # - logs git commit, conda environment, and Python path
         setup_job(output_dir=args.output_dir, seed=args.seed)
+
+        # Builds the full training config from CLI args:
+        # - parses args into an OmegaConf config
+        # - logs all parsed arguments
+        # - saves the raw config to output_dir for exact reproducibility
+        # - applies any scaling rules (e.g., LR/batch-size adjustments)
+        # Returns the finalized config object used by the rest of training.
         cfg = setup_config(args, strict_cfg=False)
+
         logger.info(cfg)
         setup_logging(
             output=os.path.join(os.path.abspath(args.output_dir), "nan_logs"),
             name="nan_logger",
         )
+
     meta_arch = {
         "SSLMetaArch": SSLMetaArch,
         "MultiDistillationMetaArch": MultiDistillationMetaArch,
@@ -607,8 +627,31 @@ def main(argv=None):
     if meta_arch is None:
         raise ValueError(f"Unknown MODEL.META_ARCHITECTURE {cfg.MODEL.META_ARCHITECTURE}")
     logger.info(f"Making meta arch {meta_arch.__name__}")
+
     with torch.device("meta"):
+        # SSLMetaArch(cfg) initialization overview:
+        # - Validates key config assumptions (local crops > 0, iBOT separate head, centering, sharding strategy).
+        # - Builds three ViT backbones from cfg:
+        #     * student_backbone, teacher_backbone (EMA teacher), and gram_backbone (for Gram loss teacher).
+        # - Records embedding dim (D) and DINO output dim (K) and logs model size/options.
+        # - Constructs projection heads for DINO and iBOT for BOTH student and teacher:
+        #     * Uses a functools.partial template so student/teacher get identical head architectures
+        #       but with independent parameters (new module instances for each call).
+        # - Instantiates loss modules:
+        #     * DINOLoss for global DINO loss.
+        #     * KoLeo (standard or distributed) for regularization.
+        #     * iBOT patch-level loss for masked token prediction.
+        # - Wraps student/teacher parts into nn.ModuleDicts and freezes teacher/EMA params (no grad).
+        # - Optionally configures knowledge distillation if enabled in cfg.
+        # - Precomputes/locks frequently used cfg scalars (loss weights, flags, crop counts).
+        # - If requested, prepares a schedule to reweight local DINO loss over iterations.
+        # - If Gram loss is enabled:
+        #     * Builds Gram teacher (either a fixed teacher backbone or uses EMA teacher),
+        #       configures GramLoss and its optional weight schedule,
+        #       checks consistency of tokens_used/img_level options and teacher source (EMA vs checkpoint),
+        #       and logs resize/crop settings for Gram teacher inputs.
         model = meta_arch(cfg)
+
     model.prepare_for_distributed_training()
     # Fill all values with `nans` so that we identify
     # non-initialized values
