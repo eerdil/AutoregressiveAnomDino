@@ -19,3 +19,4 @@ dist/
 *.pyc
 logs/
 results/
+wandb/
