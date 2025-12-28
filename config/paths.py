@@ -1,8 +1,11 @@
 import os
 
 BMIC_DATA_PATH = "/usr/bmicnas02/data-biwi-01/fm_originalzoo/dinov3"
-PROJECT_PATH = "/usr/bmicnas02/data-biwi-01/erdile_data/projects/AR_Anom_Det_Dino/dinov3"
-DATASET_PATH = "/usr/bmicnas02/data-biwi-01/bmicdatasets-originals/Originals/BMAD/BraTS2021_slice"
+PROJECT_PATH = "/usr/bmicnas02/data-biwi-01/erdile_data/projects/AR_Anom_Det_Dino/AutoregressiveAnomDino"
+DATASET_PATH = {'brats': '/usr/bmicnas02/data-biwi-01/bmicdatasets-originals/Originals/BMAD/BraTS2021_slice',
+                'bmad': '/usr/bmicnas02/data-biwi-01/bmicdatasets-originals/Originals/BMAD/hist_DIY',
+                'resc': '/usr/bmicnas02/data-biwi-01/bmicdatasets-originals/Originals/BMAD/RESC'}
+
 
 checkpoint_paths = {
     'dinov3_vits16':         os.path.join(BMIC_DATA_PATH, "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"),

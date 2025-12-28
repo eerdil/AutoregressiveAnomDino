@@ -4,7 +4,18 @@ import os
 import torch
 import torch.nn.functional as F
 from models.dinov3_utils import extract_dino_tokens_2d
-from ar.anomaly_maps import compute_anomaly_maps_2d
+# from ar.anomaly_maps import compute_anomaly_maps_2d
+
+def compute_anomaly_maps_2d(feats_2d, preds):
+    """
+    Returns:
+        anomaly_maps: [B, H_tok, W_tok]  (per-location reconstruction error)
+    """
+
+    # per-location MSE across channels
+    mse = (preds - feats_2d).pow(2).mean(dim=1)                  # [B, H, W]
+
+    return mse  # anomaly_maps
 
 def visualize_anomaly_grid(
     dino_model,
@@ -35,8 +46,12 @@ def visualize_anomaly_grid(
     imgs_vis_dev = imgs_vis.to(device)
 
     with torch.no_grad():
+        
         # 1) anomaly maps at token resolution
-        anomaly_maps = compute_anomaly_maps_2d(dino_model, ar_model, imgs_vis_dev, device)  # [B, H_tok, W_tok]
+        feats_2d = extract_dino_tokens_2d(dino_model, imgs_vis_dev, device)  # [B, C, H, W]
+        preds = ar_model(feats_2d)  # [B, C, H, W]
+
+        anomaly_maps = compute_anomaly_maps_2d(feats_2d, preds)  # [B, H_tok, W_tok]
 
         # 2) upsample to image resolution
         B = imgs_vis_dev.size(0)
@@ -52,6 +67,11 @@ def visualize_anomaly_grid(
     maps_vis_cpu    = anomaly_maps_up.detach().cpu()
     labels_vis_cpu  = labels_vis.detach().cpu()  # [B,1,H,W] with 0/1
 
+    maps_np = maps_vis_cpu.numpy()  # [B,H,W]
+
+    global_min = maps_np.min()
+    global_max = maps_np.max()
+    den = (global_max - global_min) + 1e-8
     # ------------------------------------------------------------------
     # Split into normal vs anomalous based on label mask
     # (if any pixel is 1 → anomalous)
@@ -106,11 +126,10 @@ def visualize_anomaly_grid(
 
             # --- anomaly map ---
             amap = maps_vis_cpu[idx].numpy()                  # [H,W]
-            amap_min, amap_max = amap.min(), amap.max()
-            if amap_max > amap_min:
-                amap_vis = (amap - amap_min) / (amap_max - amap_min)
-            else:
-                amap_vis = np.zeros_like(amap)
+            
+            amap_vis = (amap - global_min) / den
+            amap_vis = np.clip(amap_vis, 0.0, 1.0)
+            
             ax_map.imshow(amap_vis, cmap="hot", vmin=0.0, vmax=1.0)
             ax_map.set_title("Anomaly Map")
             ax_map.axis("off")
@@ -138,11 +157,9 @@ def visualize_anomaly_grid(
 
             # --- anomaly map (prediction) ---
             amap = maps_vis_cpu[idx].numpy()                  # [H,W]
-            amap_min, amap_max = amap.min(), amap.max()
-            if amap_max > amap_min:
-                amap_vis = (amap - amap_min) / (amap_max - amap_min)
-            else:
-                amap_vis = np.zeros_like(amap)
+            amap_vis = (amap - global_min) / den
+            amap_vis = np.clip(amap_vis, 0.0, 1.0)
+            
             ax_map.imshow(amap_vis, cmap="hot", vmin=0.0, vmax=1.0)
             ax_map.set_title("Anomaly Map")
             ax_map.axis("off")
@@ -171,6 +188,8 @@ def visualize_anomaly_grid(
 
     print(f"[Visualization] Saved anomaly grid to: {out_path}")
 
+    return out_path
+
 def denormalize_img(img_tensor):
     """
     img_tensor: [3, H, W] normalized with ImageNet stats.
@@ -185,57 +204,87 @@ def select_visualization_subset_from_loader(
     dataloader_valid,
     n_anom: int = 10,
     n_norm: int = 10,
+    max_batches: int | None = None,
 ):
     """
-    Take the first batch from `dataloader_valid` and build a visualization subset:
-      - first `n_anom` samples are anomalous (target == 1)
-      - next  `n_norm` samples are normal (target == 0)
+    Iterate over `dataloader_valid` until we collect:
+      - `n_anom` samples with target == 1
+      - `n_norm` samples with target == 0
 
-    If there are fewer than requested in either class, it will use as many as available.
+    Stops early when enough are collected. If the dataloader ends first,
+    returns as many as available.
 
     Returns:
         imgs_vis:   [B_vis, 3, H, W]
         labels_vis: [B_vis, 1, H, W]
     """
-    # Grab first batch
-    imgs, labels, targets, meta = next(iter(dataloader_valid))  # all on CPU by default
-    B = imgs.size(0)
+    anom_imgs, anom_labels = [], []
+    norm_imgs, norm_labels = [], []
 
-    anomaly_idxs = (targets == 1).nonzero(as_tuple=True)[0]
-    normal_idxs  = (targets == 0).nonzero(as_tuple=True)[0]
+    found_anom = 0
+    found_norm = 0
 
-    # How many we can actually take
-    n_anom_eff = min(n_anom, anomaly_idxs.numel())
-    n_norm_eff = min(n_norm, normal_idxs.numel())
+    for b_idx, batch in enumerate(dataloader_valid):
+        if max_batches is not None and b_idx >= max_batches:
+            break
 
-    if n_anom_eff == 0:
-        print(f"[Init] Warning: no anomalous samples in first val batch.")
-    if n_norm_eff == 0:
-        print(f"[Init] Warning: no normal samples in first val batch.")
+        imgs, labels, targets, meta = batch  # CPU by default
+        targets = targets.view(-1)
 
-    # Build index list: anomalies first, then normals
-    selected_idxs = []
-    if n_anom_eff > 0:
-        selected_idxs.append(anomaly_idxs[:n_anom_eff])
-    if n_norm_eff > 0:
-        selected_idxs.append(normal_idxs[:n_norm_eff])
+        # Take anomalies from this batch (up to remaining needed)
+        if found_anom < n_anom:
+            anom_mask = (targets == 1)
+            if anom_mask.any():
+                anom_idx = anom_mask.nonzero(as_tuple=True)[0]
+                take = min(n_anom - found_anom, anom_idx.numel())
+                sel = anom_idx[:take]
+                anom_imgs.append(imgs[sel])
+                anom_labels.append(labels[sel])
+                found_anom += take
 
-    if len(selected_idxs) == 0:
-        # total fallback: nothing? just return first min(B, n_anom+n_norm)
-        B_vis = min(B, n_anom + n_norm)
-        vis_idxs = torch.arange(B_vis)
-        print(f"[Init] No class-specific slices found, using first {B_vis} samples.")
-    else:
-        vis_idxs = torch.cat(selected_idxs, dim=0)
+        # Take normals from this batch (up to remaining needed)
+        if found_norm < n_norm:
+            norm_mask = (targets == 0)
+            if norm_mask.any():
+                norm_idx = norm_mask.nonzero(as_tuple=True)[0]
+                take = min(n_norm - found_norm, norm_idx.numel())
+                sel = norm_idx[:take]
+                norm_imgs.append(imgs[sel])
+                norm_labels.append(labels[sel])
+                found_norm += take
 
-    # Subset tensors
-    imgs_vis   = imgs[vis_idxs]    # [B_vis, 3, H, W]
-    labels_vis = labels[vis_idxs]  # [B_vis, 1, H, W]
+        # Stop if we have enough of both
+        if found_anom >= n_anom and found_norm >= n_norm:
+            break
+
+    if found_anom == 0:
+        print("[Init] Warning: no anomalous samples found in the dataloader.")
+    if found_norm == 0:
+        print("[Init] Warning: no normal samples found in the dataloader.")
+
+    # Concatenate and enforce ordering: anomalies first, then normals
+    imgs_parts = []
+    labels_parts = []
+
+    if len(anom_imgs) > 0:
+        imgs_parts.append(torch.cat(anom_imgs, dim=0))
+        labels_parts.append(torch.cat(anom_labels, dim=0))
+    if len(norm_imgs) > 0:
+        imgs_parts.append(torch.cat(norm_imgs, dim=0))
+        labels_parts.append(torch.cat(norm_labels, dim=0))
+
+    if len(imgs_parts) == 0:
+        # Total fallback: return empty tensors with correct dims if possible
+        print("[Init] No samples collected at all.")
+        return torch.empty(0), torch.empty(0)
+
+    imgs_vis = torch.cat(imgs_parts, dim=0)
+    labels_vis = torch.cat(labels_parts, dim=0)
 
     print(
-        f"[Init] Visualization set: "
-        f"{min(n_anom, anomaly_idxs.numel())} anomalous + "
-        f"{min(n_norm, normal_idxs.numel())} normal = {vis_idxs.numel()} total."
+        f"[Init] Visualization set: {found_anom}/{n_anom} anomalous + "
+        f"{found_norm}/{n_norm} normal = {imgs_vis.size(0)} total "
+        f"(scanned {b_idx + 1} batches)."
     )
 
     return imgs_vis, labels_vis

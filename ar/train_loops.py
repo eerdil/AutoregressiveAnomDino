@@ -1,21 +1,44 @@
 import os
 import torch
 import torch.nn as nn
+import wandb
 from models.dinov3_utils import extract_dino_tokens_2d
 import torch.optim as optim
+from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision
 from ar.visualization import visualize_anomaly_grid
+import torch.nn.functional as F
 
-def validate_ar2d_model(dino_model, ar_model, val_loader, device):
+def evaluate_ar2d_model(
+    dino_model, 
+    ar_model, 
+    dataloader, 
+    criterion,
+    device,
+    imgs_vis=None, 
+    labels_vis=None,
+    epoch=None,
+    img_size=240,
+    output_path=None,
+):
     dino_model.eval()
     ar_model.eval()
 
-    criterion = nn.MSELoss()
+    if output_path is not None:
+        os.makedirs(output_path, exist_ok=True)
+
+    # Streaming metrics (no giant concatenation)
+    auroc_metric = BinaryAUROC().to(device)
+    aupr_metric = BinaryAveragePrecision().to(device)
+
     running_loss = 0.0
     n_batches = 0
 
     with torch.no_grad():
-        for imgs, labels, targets, meta in val_loader:
+        for imgs, labels, targets, meta in dataloader:
             imgs = imgs.to(device)
+            labels = labels.to(device)          # pixel GT mask (0/1)
+            targets = targets.to(device)        # image-level 0/1 (not needed for pixel metrics)
+
 
             feats_2d = extract_dino_tokens_2d(dino_model, imgs, device)  # [B, C, H, W]
             preds = ar_model(feats_2d)                                   # [B, C, H, W]
@@ -24,13 +47,68 @@ def validate_ar2d_model(dino_model, ar_model, val_loader, device):
             running_loss += loss.item()
             n_batches += 1
 
+            # 1) anomaly maps at token level
+            anomaly_maps = (preds - feats_2d).pow(2).mean(dim=1)    
+
+            # 2) upsample to image resolution and add channel dim: [B,1,H,W]
+            anomaly_maps_up = F.interpolate(
+                anomaly_maps.unsqueeze(1),      # [B,1,H_tok,W_tok]
+                size=(img_size, img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            # ensure label map matches upsampled prediction size
+            if labels.shape[-2:] != anomaly_maps_up.shape[-2:]:
+                labels = F.interpolate(labels, size=anomaly_maps_up.shape[-2:], mode="nearest")
+
+            # 3) flatten per-batch for TorchMetrics
+            preds_batch = anomaly_maps_up.view(-1)        # [B*H*W]
+            labels_batch = labels.view(-1).int()         # [B*H*W]
+
+            # 4) update streaming metrics
+            auroc_metric.update(preds_batch, labels_batch)
+            aupr_metric.update(preds_batch, labels_batch)
+
     avg_loss = running_loss / max(1, n_batches)
-    return avg_loss
+
+    # Compute final metrics
+    auroc = auroc_metric.compute().item()
+    aupr = aupr_metric.compute().item()
+
+    output_path_metrics = os.path.join(output_path, "metrics/")
+    os.makedirs(output_path_metrics, exist_ok=True)
+    with open(os.path.join(output_path_metrics, "metrics.txt"), "w") as f:
+        f.write(f"AUROC: {auroc:.4f}\n")
+        f.write(f"AUPR:  {aupr:.4f}\n")
+
+    metrics = {
+        "AUROC": auroc,
+        "AUPR": aupr,
+    }
+
+    # Visualization on fixed images
+    output_path_visualizations = None
+    if imgs_vis is not None and labels_vis is not None:
+        output_path_visualizations = os.path.join(output_path, "visualizations/")
+        output_path_visualizations = visualize_anomaly_grid(
+            dino_model=dino_model,
+            ar_model=ar_model,
+            imgs_vis=imgs_vis,      # fixed across epochs
+            labels_vis=labels_vis,
+            device=device,
+            img_size=img_size,
+            output_dir=output_path_visualizations,
+            epoch=epoch,
+        )
+
+    return avg_loss, metrics, output_path_visualizations
 
 def train_ar2d_model(dino_model, 
                      ar_model, 
                      train_loader, 
                      val_loader,
+                     test_loader,
                      device,
                      epochs=10, 
                      lr=1e-3,
@@ -47,6 +125,9 @@ def train_ar2d_model(dino_model,
     optimizer = optim.Adam(ar_model.parameters(), lr=lr)
 
     best_val_loss = float("inf")
+    best_test_aupr = -float("inf")
+    best_val_aupr = -float("inf")
+
     best_epoch = -1
 
     if output_dir is not None:
@@ -76,49 +157,155 @@ def train_ar2d_model(dino_model,
             running_loss += loss.item()
             n_batches += 1
 
-        avg_train = running_loss / max(1, n_batches)
-        print(f"[Epoch {epoch}/{epochs}] AR2D train loss: {avg_train:.6f}")
+        train_loss = running_loss / max(1, n_batches)
 
-        # ---- Validation step every val_interval epochs ----
-        if (val_loader is not None) and (epoch % val_interval == 0):
-            val_loss = validate_ar2d_model(dino_model, ar_model, val_loader, device)
-            print(f"           -> val loss: {val_loss:.6f}")
+        # === VALIDATION STEP ===
+        # val_loss, val_metrics, val_visualizations_path = evaluate_ar2d_model(dino_model, ar_model, val_loader, device)
+        val_loss, val_metrics, val_visualizations_path = evaluate_ar2d_model(
+            dino_model=dino_model,
+            ar_model=ar_model,
+            dataloader=val_loader,
+            imgs_vis=imgs_vis,
+            labels_vis=labels_vis,
+            criterion=criterion,
+            device=device,
+            epoch=epoch,
+            output_path=os.path.join(output_dir, "val"),
+        )
 
-            # Visualization on the same fixed images every val epoch
-            if imgs_vis is not None:
-                visualize_anomaly_grid(
-                    dino_model=dino_model,
-                    ar_model=ar_model,
-                    imgs_vis=imgs_vis,      # fixed across epochs
-                    labels_vis=labels_vis,
-                    device=device,
-                    img_size=img_size,
-                    output_dir=os.path.join(output_dir, "val_visualizations"),
-                    epoch=epoch,
+        # === TEST STEP ===
+        # test_loss, test_metrics, test_visualizations_path = evaluate_ar2d_model(dino_model, ar_model, test_loader, device)
+        test_loss, test_metrics, test_visualizations_path = evaluate_ar2d_model(
+            dino_model=dino_model,
+            ar_model=ar_model,
+            dataloader=test_loader,
+            imgs_vis=imgs_vis,
+            labels_vis=labels_vis,
+            criterion=criterion,
+            device=device,
+            epoch=epoch,
+            output_path=os.path.join(output_dir, "test"),
+        )
+
+        # === SAVE BEST MODELS ===
+        ckpt_dir = os.path.join(output_dir, "ckpt")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+
+        # Save model with best validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+
+            ckpt_path_val = os.path.join(ckpt_dir, "model_best_val_loss.pth")
+
+            torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": ar_model.state_dict(),
+                        "val_loss": val_loss,
+                        "img_size": img_size,
+                    },
+                    ckpt_path_val,
+                )
+        
+        # Save model with best validation AUPR
+        if val_metrics["AUPR"] > best_val_aupr:
+            best_val_aupr = val_metrics["AUPR"]
+
+            ckpt_path_val = os.path.join(ckpt_dir, "model_best_val_aupr.pth")
+
+            torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": ar_model.state_dict(),
+                        "val_loss": val_loss,
+                        "img_size": img_size,
+                    },
+                    ckpt_path_val,
+                )
+            
+        # Save model with best test AUPR
+        if test_metrics["AUPR"] > best_test_aupr:
+            best_test_aupr = test_metrics["AUPR"]
+
+            ckpt_path_test = os.path.join(ckpt_dir, "model_best_test_aupr.pth")
+
+            torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": ar_model.state_dict(),
+                        "val_loss": val_loss,
+                        "img_size": img_size,
+                    },
+                    ckpt_path_test,
                 )
 
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_epoch = epoch
-                if output_dir is not None:
-                    ckpt_dir = os.path.join(output_dir, "ckpt")
-                    os.makedirs(ckpt_dir, exist_ok=True)
-                    ckpt_path = os.path.join(ckpt_dir, "model.pth")
+        # === LOGGING ===
+        log_dict = {"epoch": epoch, 
+                   "train/train_loss": train_loss, 
+                   "val/val_loss": val_loss, 
+                   "test/test_loss": test_loss,
+                   "val/AUROC": val_metrics["AUROC"],
+                   "val/AUPR": val_metrics["AUPR"],
+                   'test/AUROC': test_metrics["AUROC"],
+                   'test/AUPR': test_metrics["AUPR"],
+                   }
 
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "model_state_dict": ar_model.state_dict(),
-                            "val_loss": val_loss,
-                            "img_size": img_size,
-                        },
-                        ckpt_path,
-                    )
-                    print(f"           -> New best model saved to: {ckpt_path}")
+        # Print epoch progress to console
+        log_msg = f"[Epoch {epoch}/{epochs}] | " + " | ".join([f"{k}: {v:.4f}" for k, v in log_dict.items() if k != "epoch"])
+        print(log_msg)
 
-    print(f"Training finished. Best val loss: {best_val_loss:.6f} (epoch {best_epoch})")
+        log_dict.update({"val/visualization": wandb.Image(val_visualizations_path),
+                         "test/visualization": wandb.Image(test_visualizations_path)})
+
+        # Log in WandB
+        wandb.log(log_dict, step=epoch)
+
     return ar_model
+
+
+
+
+    #     # ---- Validation step every val_interval epochs ----
+    #     if (val_loader is not None) and (epoch % val_interval == 0):
+    #         val_loss = validate_ar2d_model(dino_model, ar_model, val_loader, device)
+    #         print(f"           -> val loss: {val_loss:.6f}")
+
+    #         # Visualization on the same fixed images every val epoch
+    #         if imgs_vis is not None:
+    #             visualize_anomaly_grid(
+    #                 dino_model=dino_model,
+    #                 ar_model=ar_model,
+    #                 imgs_vis=imgs_vis,      # fixed across epochs
+    #                 labels_vis=labels_vis,
+    #                 device=device,
+    #                 img_size=img_size,
+    #                 output_dir=os.path.join(output_dir, "val_visualizations"),
+    #                 epoch=epoch,
+    #             )
+
+    #         # Save best model
+    #         if val_loss < best_val_loss:
+    #             best_val_loss = val_loss
+    #             best_epoch = epoch
+    #             if output_dir is not None:
+    #                 ckpt_dir = os.path.join(output_dir, "ckpt")
+    #                 os.makedirs(ckpt_dir, exist_ok=True)
+    #                 ckpt_path = os.path.join(ckpt_dir, "model.pth")
+
+    #                 torch.save(
+    #                     {
+    #                         "epoch": epoch,
+    #                         "model_state_dict": ar_model.state_dict(),
+    #                         "val_loss": val_loss,
+    #                         "img_size": img_size,
+    #                     },
+    #                     ckpt_path,
+    #                 )
+    #                 print(f"           -> New best model saved to: {ckpt_path}")
+
+    # print(f"Training finished. Best val loss: {best_val_loss:.6f} (epoch {best_epoch})")
+    # return ar_model
 
 def train_bidirectional_ar2d_model(
     dino_model,

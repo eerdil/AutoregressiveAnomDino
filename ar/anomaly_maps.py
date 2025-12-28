@@ -2,23 +2,23 @@ import torch
 import torch.nn.functional as F
 from models.dinov3_utils import extract_dino_tokens_2d
 
-def compute_anomaly_maps_2d(dino_model, ar_model, imgs, device):
-    """
-    imgs: [B, 3, H, W]
-    Returns:
-        anomaly_maps: [B, H_tok, W_tok]  (per-location reconstruction error)
-    """
-    dino_model.eval()
-    ar_model.eval()
+# def compute_anomaly_maps_2d(dino_model, ar_model, imgs, device):
+#     """
+#     imgs: [B, 3, H, W]
+#     Returns:
+#         anomaly_maps: [B, H_tok, W_tok]  (per-location reconstruction error)
+#     """
+#     dino_model.eval()
+#     ar_model.eval()
 
-    with torch.no_grad():
-        feats_2d = extract_dino_tokens_2d(dino_model, imgs, device)  # [B, C, H, W]
-        preds = ar_model(feats_2d)                                   # [B, C, H, W]
+#     with torch.no_grad():
+#         feats_2d = extract_dino_tokens_2d(dino_model, imgs, device)  # [B, C, H, W]
+#         preds = ar_model(feats_2d)                                   # [B, C, H, W]
 
-        # per-location MSE across channels
-        mse = (preds - feats_2d).pow(2).mean(dim=1)                  # [B, H, W]
+#         # per-location MSE across channels
+#         mse = (preds - feats_2d).pow(2).mean(dim=1)                  # [B, H, W]
 
-    return mse  # anomaly_maps
+#     return mse  # anomaly_maps
 
 def compute_anomaly_maps_2d_bidirectional(dino_model, ar_model_fwd, ar_model_bwd, imgs, device, reduce="mean"):
     """
